@@ -15,10 +15,13 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="counters.cpp">
+    <ClCompile Include="counters void.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
     <ClCompile Include="내가 모르는 C++ 기초.cpp">
+      <Filter>소스 파일</Filter>
+    </ClCompile>
+    <ClCompile Include="counters.cpp">
       <Filter>소스 파일</Filter>
     </ClCompile>
   </ItemGroup>
