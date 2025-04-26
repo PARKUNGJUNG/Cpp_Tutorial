@@ -1,163 +1,160 @@
 #include <iostream>
-#include <thread>
-#include <mutex>
-#include <vector>
-#include <windows.h>
-#include <conio.h>
-#include <string>
 #include <atomic>
+#include <mutex>
+#include <condition_variable>
+#include <thread>
+#include <conio.h>
+#include <windows.h>
+
 using namespace std;
 
-// 전역 변수
-mutex mtx; // 출력 및 데이터 동기화
-vector<int> counters; // 각 카운터의 현재 값
-vector<bool> is_counting; // 각 카운터의 상태 (true: counting, false: paused)
-atomic<bool> terminate_flag{ false }; // 프로그램 종료 플래그
-int selected_counter = 0; // 현재 선택된 카운터 인덱스
-int n, max_count; // 카운터 개수, 최대값
-double freq; // 초당 카운트 횟수 (Hz)
+const int MAX_COUNTERS = 16;  //최대 카운터 개수
 
-/*
- * Visual Studio 설정 방법:
- * 1. 솔루션 탐색기에서 프로젝트 우클릭 -> 속성
- * 2. 구성 속성 -> 일반 -> C++ 언어 표준: ISO C++17 (/std:c++17)
- * 3. 구성 속성 -> 디버깅 -> 명령 인수: 예: "3 2 9"
- * 4. 디버그 모드로 실행 (F5)
- * 명령 프롬프트 실행 예: C++Tutorial.exe 3 2 9
- * 키 동작:
- *   - 'n': 다음 카운터 선택 (counter0 -> counter1 -> ...)
- *   - Space: 선택된 카운터 카운팅/일시정지 토글 (0~9 순환)
- *   - 'q': 프로그램 종료
- */
+//카운터 구조체
+struct Counter {
+    atomic<int> value{ 0 }; //카운트 값
+    atomic<bool> running{ false }; //동작 상태
+    int id = 0; //카운터 번호
+};
 
- // 화면 지우기 함수
-void clear_screen() {
-    system("cls");
+//전역 변수
+int selected = 0; //현재 선택된 카운터
+atomic<bool> terminate_all{ false }; //프로그램 종료 플래그
+mutex print_mutex; //출력 동기화용 뮤텍스
+
+//콘솔 화면 너비 가져오기
+int getConsoleWidth() {
+    CONSOLE_SCREEN_BUFFER_INFO csbi;
+    GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &csbi);
+    return csbi.srWindow.Right - csbi.srWindow.Left + 1;
 }
 
-// 시스템 메시지 출력
-void print_system_message(const string& msg) {
-    lock_guard<mutex> lock(mtx);
-    cout << msg << endl;
+//커서를 화면 맨 위로 이동, 최적화를 위해 사용함
+void moveCursorTop() {
+    COORD coord = { 0, 0 };
+    SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), coord);
 }
 
-// 카운터 스레드 함수
-void counter_thread(int id, double delay_ms) {
-    while (!terminate_flag) {
-        if (is_counting[id]) {
-            lock_guard<mutex> lock(mtx);
-            counters[id]++;
-            if (counters[id] > max_count) {
-                counters[id] = 0;
+//한 줄 지우기
+void clearLine(int y, int width) {
+    COORD coord = { 0, static_cast<SHORT>(y) };
+    SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), coord);
+    cout << string(width, ' ');
+    SetConsoleCursorPosition(GetStdHandle(STD_OUTPUT_HANDLE), coord);
+}
+
+//카운터 상태 출력
+void print_status(Counter counters[MAX_COUNTERS], int n) {
+    lock_guard<mutex> lock(print_mutex);
+    const int width = getConsoleWidth();
+    const int output_width = 25; //고정 출력 폭
+
+    moveCursorTop(); //화면 최상단으로 이동, 최적화를 위해 사용함.
+
+    //각 카운터 정보 출력
+    for (int i = 0; i < n; ++i) {
+        clearLine(i, width);
+        cout << "counter" << counters[i].id << " : " <<
+            counters[i].value << " (" <<
+            (counters[i].running ? "counting" : "paused") << ")";
+        if (cout.tellp() < output_width) cout << string(output_width - cout.tellp(), ' ');
+    }
+
+    clearLine(n, width);  //카운터 목록과 상태정보 구분용 공백
+
+    //현재 선택/변경 상태 출력
+    clearLine(n + 1, width);
+    cout << "counter" << selected << " -> counter" << ((selected + 1) % n);
+    if (cout.tellp() < output_width) cout << string(output_width - cout.tellp(), ' ');
+
+    clearLine(n + 2, width);
+    cout << "current: counter" << selected << " (" <<
+        (counters[selected].running ? "counting" : "paused") << ")";
+    if (cout.tellp() < output_width) cout << string(output_width - cout.tellp(), ' ');
+}
+
+//카운터 값을 주기적으로 갱신하는 스레드
+void counter_manager(Counter counters[MAX_COUNTERS], int n, int max, int freq) {
+    while (!terminate_all) {
+        auto start = clock();
+
+        for (int i = 0; i < n; ++i) {
+            if (counters[i].running) {
+                counters[i].value = (counters[i].value + 1) % (max + 1);
+                print_status(counters, n); //값 변경 시 화면 갱신
             }
         }
-        Sleep(static_cast<int>(delay_ms));
+
+        auto elapsed = clock() - start;
+        auto sleep_ms = max(0, 1000 / freq - static_cast<int>(elapsed));
+        this_thread::sleep_for(chrono::milliseconds(sleep_ms));
     }
 }
 
-// UI 스레드 함수
-void ui_thread() {
-    while (!terminate_flag) {
-        // 키 입력 처리
-        if (_kbhit()) {
+//사용자 입력을 처리하는 스레드
+void ui_thread(Counter counters[MAX_COUNTERS], int n) {
+    print_status(counters, n); //초기 출력
+
+    while (!terminate_all) {
+        if (_kbhit()) { //키 입력 감지
             int key = _getch();
-            lock_guard<mutex> lock(mtx);
-            if (key == 'q') {
-                terminate_flag = true;
-                print_system_message("Program terminating...");
+            if (key == 'q') { //q입력시 종료
+                terminate_all = true;
+                break;
             }
-            else if (key == 'n') {
-                int prev = selected_counter;
-                selected_counter = (selected_counter + 1) % n;
-                print_system_message("counter" + to_string(prev) + " -> counter" + to_string(selected_counter));
+            else if (key == 'n') { //n입력시 다음 카운터 선택
+                selected = (selected + 1) % n;
+                print_status(counters, n);
             }
-            else if (key == ' ') {
-                is_counting[selected_counter] = !is_counting[selected_counter];
-                string state = is_counting[selected_counter] ? "activated" : "paused";
-                print_system_message("counter" + to_string(selected_counter) + " " + state);
+            else if (key == ' ') { //스페이스바로 선택된 카운터 실행/정지
+                counters[selected].running = !counters[selected].running;
+                print_status(counters, n);
             }
         }
-
-        // 화면 출력
-        {
-            lock_guard<mutex> lock(mtx);
-            clear_screen();
-            for (int i = 0; i < n; ++i) {
-                string state = is_counting[i] ? "counting" : "paused";
-                cout << "counter" << i << " : " << counters[i] << " (" << state << ")" << endl;
-            }
-            string state = is_counting[selected_counter] ? "counting" : "paused";
-            cout << "current: counter" << selected_counter << " (" << state << ")" << endl;
-            cout.flush();
-        }
-        Sleep(200); // 갱신 주기
+        this_thread::sleep_for(chrono::milliseconds(50)); //너무빠른 체크방지
     }
+}
+
+//문자열을 정수로 변환
+int string_to_int(const char* str) {
+    int result = 0;
+    while (*str != '\0') {
+        result = result * 10 + (*str - '0');
+        ++str;
+    }
+    return result;
 }
 
 int main(int argc, char* argv[]) {
-    // 기본값 설정
-    n = 3; // 기본 카운터 개수
-    freq = 2.0; // 기본 초당 횟수 (Hz)
-    max_count = 9; // 기본 최대값 (0~9)
-
-    // 명령행 인자 처리
-    if (argc == 4) {
-        try {
-            n = stoi(argv[1]);
-            freq = stod(argv[2]);
-            // max_count는 9로 고정 (요구사항: 0~9)
-        }
-        catch (...) {
-            lock_guard<mutex> lock(mtx);
-            cout << "Invalid arguments. Using default values: n=3, freq=2, max=9" << endl;
-        }
-
-        // 인자 유효성 검사
-        if (n < 1 || n > 16 || freq <= 0) {
-            lock_guard<mutex> lock(mtx);
-            cout << "Invalid arguments. Constraints: 1 <= n <= 16, freq > 0" << endl;
-            cout << "Using default values: n=3, freq=2, max=9" << endl;
-            n = 3;
-            freq = 2.0;
-            max_count = 9;
-        }
-    }
-    else if (argc != 1) {
-        lock_guard<mutex> lock(mtx);
-        cout << "Usage: " << argv[0] << " <n> <freq> <max>" << endl;
-        cout << "Using default values: n=3, freq=2, max=9" << endl;
-    }
-    else {
-        lock_guard<mutex> lock(mtx);
-        cout << "No arguments provided. Using default values: n=3, freq=2, max=9" << endl;
+    if (argc != 4) {
+        cerr << "Usage: " << argv[0] << " <n: 1~16> <freq: Hz> <max>\n";
+        return 1;
     }
 
-    // 초기화
-    counters.resize(n, 0); // 모든 카운터 0으로 초기화
-    is_counting.resize(n, false); // 모든 카운터 paused 상태로 초기화
-    double delay_ms = 1000.0 / freq; // 카운트 주기 (ms)
+    //명령줄 인자 파싱
+    int n = string_to_int(argv[1]);
+    int freq = string_to_int(argv[2]);
+    int max = string_to_int(argv[3]);
 
-    // 스레드 생성
-    vector<thread> counter_threads;
-    counter_threads.reserve(n);
-    for (int i = 0; i < n; ++i) {
-        counter_threads.push_back(thread(counter_thread, i, delay_ms));
-    }
-    thread ui(ui_thread);
-
-    // 스레드 종료 대기
-    if (ui.joinable()) {
-        ui.join();
-    }
-    for (auto& t : counter_threads) {
-        if (t.joinable()) {
-            t.join();
-        }
+    if (n < 1 || n > MAX_COUNTERS || freq <= 0 || max < 0) {
+        cerr << "Invalid arguments.\n";
+        return 1;
     }
 
-    {
-        lock_guard<mutex> lock(mtx);
-        cout << "===end of main()===" << endl;
-    }
+    Counter counters[MAX_COUNTERS];
+    for (int i = 0; i < n; ++i) counters[i].id = i;
+
+    //출력 공간 확보
+    for (int i = 0; i < n + 5; ++i) cout << endl;
+
+    //스레드 실행
+    thread counter(counter_manager, counters, n, max, freq);
+    thread ui(ui_thread, counters, n);
+
+    //스레드 종료 대기
+    ui.join();
+    counter.join();
+
+    cout << "\n=== end of program ===\n";
     return 0;
 }
